@@ -1,0 +1,12 @@
+Host        host-0001.example.org.aide
+Hostname    host-0001.example.org
+
+Host        host-0002.example.org.aide
+Hostname    10.10.10.102
+
+Host        *
+            ConnectTimeout          10
+            Protocol                2
+            ServerAliveInterval     42
+            IdentityFile            /home/aidewatch/.ssh/id_rsa_aide
+            User                    aidewatch

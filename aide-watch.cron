@@ -1,0 +1,12 @@
+# sample cron job for running aide-watch
+#
+# random delay before start, up to 10m
+
+# this should match a host entry in the ssh config file
+TARGET = HOSTNAME
+
+SHELL = /bin/bash
+TARGET_DIR = /var/db/aide-watch/targets
+MAILTO = aide-reports@example.org
+
+10 1 * * *  root    sleep $((1 + $RANDOM \% 600)) ; /sbin/chpst -L $TARGET_DIR/$TARGET/lock /usr/local/bin/aide-watch --target $TARGET --generate --compare 2>&1 |/bin/mail -E -s "AIDE report for $TARGET" "$MAILTO"

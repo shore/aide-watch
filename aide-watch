@@ -1,0 +1,283 @@
+#! /usr/bin/env bash
+#
+# Copyright 2014 Brian Shore.  All Rights Reserved.
+# Use of this source code is governed by a BSD-style
+# license that can be found in the LICENSE file.
+#
+
+set -euo pipefail
+
+readonly ME=${0##*/}
+readonly TSTAMP=$(date +%Y%m%dT%H%M%S)
+: ${AIDE:=/usr/local/bin/aide}
+: ${ROOT_PATH:=/var/db/aide-watch}
+
+function usage {
+
+    cat <<EOF
+Usage
+    $ME [ parameters ]
+
+Overview
+    The aide-watch tool is a multi-call binary that automates aide
+    database generation and retrieval for preconfigured targets (via
+    ssh key).  When the program is not run as "aide-watch," it's name
+    as-called will be shown in this information page.  The tool may be
+    copied, linked, or symlinked to targets identified by name or IP
+    address.  SSH will follow its usual conventions when resolving names.
+
+    When configuring new targets, consider adding them to the aide-watch
+    ssh_config and using the included cron job as a template.
+
+
+Parameters
+    --help
+    --auth              Emit authorized_keys-style entry allowing aide scans.
+                        The public key will need to be added.
+    --compare           Don't generate a databse for the target, only compare
+                        existing databases.
+    --generate          Generate a database for the target but do not
+                        compare it to any other database.  This must be run
+                        for a target to create an initial database used in
+                        comparisons for future scans.
+    --rebase db         Update "base" symlink to point to the specified
+                        database file.  The db must be specified and may take
+                        any of the formats allowed for the AW_DB* environment
+                        variables.
+    --target node       Target the specified node.  This includes an ssh session
+                        for db generation and the location to find databases for
+                        compare and rebase operations.  This parameter overrides
+                        the AW_TARGET environment variable.
+
+Environment Variables
+    AW_TARGET           Target to scan; default:  argv[0]
+    AW_DB1
+    AW_DB2              The databases to compare.  The reference database is
+                        named "base.db" (typically a symbolic link) and the
+                        database to compare is the most recent (by timestamp
+                        in filename).  Databases may be specified by absolute
+                        or relative path (must end with ".db"), or by
+                        timestamp (YYYYmmddTHHMMSS).
+
+EOF
+
+}
+
+
+function emit_auth {
+
+    readonly CMD='command="/usr/bin/nice /usr/bin/sudo /usr/sbin/aide -c - --init -B report_url=stderr -B database_out=stdout"'
+    readonly LIMITS='no-agent-forwarding,no-X11-forwarding,no-port-forwarding'
+
+    echo "${LIMITS},${CMD} "
+}
+
+# run aide --init on target
+function generate_db {
+    local target="$1"
+
+    local dbfile=${TSTAMP}.db
+    local repfile=${TSTAMP}.report
+
+    # this remote command should be overridden via authorized_keys on $target
+    /usr/bin/ssh -F "$ROOT_PATH"/ssh_config "$target" /generate_db < "$conf" > "$dbfile" 2>"$repfile"
+
+    if [ ! -s "$repfile" ]; then
+        /bin/rm -f "$repfile"
+    fi
+}
+
+# given some target and identifier, find the corresponding database
+# allowed:  full path || filename || timestamp
+function resolve_db_file {
+    local id="$1"
+
+    local filename='' pattern='^[[:digit:]]{8}T[[:digit:]]{6}$'
+    if [[ "$id" =~ / ]]; then
+        if [ "${id:1}" = / ]; then
+            filename="${target_dir}/${id}"
+        else
+            filename="$(readlink -f "$id")"
+        fi
+    elif [[ "$id" =~ $pattern ]]; then
+        filename="${target_dir}/${id}.db"
+    else
+        filename="${target_dir}/${id}"
+    fi
+
+    if [ -e "$filename" ]; then
+        echo "$filename"
+    else
+        echo "$filename: database file does not exist" >&2
+        return 1
+    fi
+}
+
+# select a reference db
+function select_ref_db {
+    local filename
+
+    if [ -n "${AW_DB1:-}" ]; then
+        resolve_db_file "$AW_DB1"
+    else
+        filename="${target_dir}/base.db"
+        if [ ! -e "$filename" ]; then
+            echo "$filename: reference database file does not exist" >&2
+            return 1
+        else
+            echo "$filename"
+        fi
+    fi
+}
+
+# select a db file to compare to the reference db
+function select_comp_db {
+    local filename
+
+    if [ -n "${AW_DB2:-}" ]; then
+        resolve_db_file "$AW_DB2"
+    else
+        filename="$(/usr/bin/find "$target_dir/" -type f -name \*.db |sort |tail -n 1)"
+        if [ -n "$filename" ]; then
+            echo "$filename"
+        else
+            echo "Unable to find database for comparison to reference data." >&2
+            return 1
+        fi
+    fi
+}
+
+function compare_dbs {
+    local aideconf="$1"
+
+    local db1 db2 last2
+
+    db1="$(select_ref_db)"
+    db2="$(select_comp_db)"
+
+    echo "-- Comparing database ${db2##*/} against reference ${db1##*/}"
+    "$AIDE" -c "$aideconf" --compare -B report_url=stdout -B database=fd:3 -B database_new=fd:4 3<"$db1" 4<"$db2"
+    echo "-- aide exit status: $?"
+}
+
+function rebase {
+    local target="$1" base="$2"
+
+    local filename
+    filename="$(resolve_db_file "$base")"
+    /bin/ln -sf "$filename" "${target_dir}/base.db"
+}
+
+# env overrides argv[0]
+function id_target {
+    local id target=$1
+
+    if [ -n "$target" ]; then
+        echo "$target"
+        return 0
+    fi
+
+    id=${AW_TARGET:-$ME}
+    if [ "$id" = "aide-watch" ]; then
+        echo "Failed to identify scan target; consider setting AW_TARGET environment variable." >&2
+        return 1
+    fi
+
+    echo "$id"
+}
+
+
+function main {
+    local args generate=0 compare=0 rebase=0 target
+    local base
+
+    args=$(getopt -n "$ME" -o h \
+        --long auth,compare,help,generate,rebase:,target: \
+        -- "$@")
+
+    [ $? != 0 ] && { echo "Terminating..." >&2 ; return 1 ; } || :
+
+    eval set -- "$args"
+
+    while true ; do
+        case $1 in
+
+            --auth)
+                emit_auth
+                return $?
+                ;;
+
+            --compare)
+                # just compare 2 existing DBs
+                compare=1
+                shift
+                ;;
+
+            --help)
+                usage ; return 0
+                ;;
+
+            --generate)
+                # only generate (initial?) DB in init mode
+                generate=1
+                shift
+                ;;
+
+            --rebase)
+                # parameter is required to avoid race conditions between
+                #   user choosing to update and a new database file appearing
+                base="$2"
+                rebase=1
+                shift 2
+                ;;
+
+            --target)
+                # node to scan
+                target="$2"
+                shift 2
+                ;;
+
+            --) shift ; break ;;
+            *) echo "Internal error!" >&2 ; echo "Whence cometh parmaeter $1?" >&2 ; return 1 ;;
+        esac
+    done
+
+    if [ 0 = $generate -a 0 = $compare -a 0 = $rebase ]; then
+        # if no ops specified, default to generate new and compare
+        #   new to existing base
+        generate=1
+        compare=1
+    fi
+    declare -r generate compare rebase
+
+    local conf=aide.conf
+    local target=$(id_target "${target:-}")
+
+    local target_dir="${ROOT_PATH}/targets/$target"
+    /bin/mkdir -p "$target_dir"
+    cd "$target_dir"
+
+    if ! [ -e $conf ]; then
+        echo "$conf: configuration file not found (pwd => $(/bin/pwd))" >&2
+        return 1
+    fi
+
+    # this should be done before a rebase if both are to be done
+    if [ $generate = 1 ]; then
+        generate_db "$target"
+    fi
+
+    # this should be done before a compare if both are to be done
+    if [ $rebase = 1 ]; then
+        rebase $target $base
+    fi
+
+    if [ $compare = 1 ]; then
+        compare_dbs "$conf"
+    fi
+
+}
+main "$@"
+
+# done
+# vim: set ts=4 sw=4 tw=0 et :
